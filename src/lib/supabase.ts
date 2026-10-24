@@ -6,42 +6,40 @@ import { createClient } from '@supabase/supabase-js'
 // Both formats (sb_publishable_... and eyJ...) work with the Supabase JS client.
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL as string | undefined
-const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY) as string | undefined
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined
 
 // ─── Config validation ─────────────────────────────────────────────────────
 
 const PLACEHOLDER = 'PASTE_YOUR_PUBLISHABLE_KEY_HERE'
 
+if (!supabaseUrl) {
+  console.error(
+    '[Filmdappa CRM] Error: Missing environment variable VITE_SUPABASE_URL. ' +
+    'Please set VITE_SUPABASE_URL in your Netlify environment variables or local .env file.'
+  )
+}
+
+if (!supabaseAnonKey) {
+  console.error(
+    '[Filmdappa CRM] Error: Missing environment variable VITE_SUPABASE_ANON_KEY. ' +
+    'Please set VITE_SUPABASE_ANON_KEY in your Netlify environment variables or local .env file.'
+  )
+}
+
 function isConfigured(): boolean {
   if (!supabaseUrl || !supabaseAnonKey) return false
   if (supabaseAnonKey === PLACEHOLDER) return false
-  if (supabaseUrl.includes('placeholder')) return false
+  if (supabaseUrl.includes('placeholder') || supabaseUrl.includes('YOUR_PROJECT_REF')) return false
   return true
 }
 
 export const isSupabaseReady = isConfigured()
 
-if (!isSupabaseReady) {
-  if (!supabaseUrl) {
-    console.error('[Filmdappa CRM] VITE_SUPABASE_URL is missing. Add it to your .env file.')
-  } else if (!supabaseAnonKey || supabaseAnonKey === PLACEHOLDER) {
-    console.error(
-      '[Filmdappa CRM] VITE_SUPABASE_ANON_KEY is not set. ' +
-      'Open your .env file and replace PASTE_YOUR_PUBLISHABLE_KEY_HERE ' +
-      'with your Supabase publishable (anon) key, then restart the dev server.'
-    )
-  }
-}
-
 // ─── Supabase client ────────────────────────────────────────────────────────
-// We always create the client (with safe fallbacks) so imports don't crash.
-// isSupabaseReady tells callers whether to proceed with real API calls.
 
 export const supabase = createClient(
-  supabaseUrl || 'https://hzxbafhukbnopygzsvyc.supabase.co',
-  supabaseAnonKey && supabaseAnonKey !== PLACEHOLDER
-    ? supabaseAnonKey
-    : 'placeholder-anon-key-replace-in-env',
+  supabaseUrl || '',
+  supabaseAnonKey || '',
   {
     auth: {
       autoRefreshToken: true,

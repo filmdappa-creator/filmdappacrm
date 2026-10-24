@@ -9,7 +9,7 @@ login system to work end-to-end.
 
 | Setting | Value |
 |---|---|
-| Project URL | `https://hzxbafhukbnopygzsvyc.supabase.co` |
+| Project URL | `https://YOUR_PROJECT_REF.supabase.co` |
 | Region | As selected during project creation |
 
 ---
