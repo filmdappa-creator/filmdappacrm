@@ -1,6 +1,7 @@
 import { FormEvent, useState, useEffect } from 'react'
 import { useAuth } from './AuthContext'
 import { FaceVerification } from './FaceVerification'
+import filmdappaLogo from '../assets/filmdappa-logo.jpg'
 
 // ─── Shared branded shell ─────────────────────────────────────────────────────
 
@@ -8,20 +9,30 @@ function LoginShell({ children }: { children: React.ReactNode }) {
   return (
     <main className="login-page">
       <section className="login-brand">
-        <div className="brand-mark large-mark">F</div>
-        <div>
-          <span>FILMDAPPA</span>
-          <small>MEDIA COMPANY</small>
-        </div>
-        <div className="brand-statement">
-          <span>SECURE WORKSPACE</span>
-          <h1>One clear view of your business.</h1>
+        <header className="login-brand-header">
+          <img
+            src={filmdappaLogo}
+            alt="Filmdappa logo"
+            className="login-brand-logo"
+          />
+          <div className="login-brand-text">
+            <strong>FILMDAPPA</strong>
+            <small>MEDIA COMPANY</small>
+          </div>
+        </header>
+
+        <div className="login-brand-body">
+          <span className="login-brand-badge">SECURE WORKSPACE</span>
+          <h1>A clearer view of your business.</h1>
           <p>
             Multi-step identity verification protects your financial records and
             client data.
           </p>
         </div>
-        <small className="copyright">© 2025 Filmdappa Media Company</small>
+
+        <footer className="login-brand-footer">
+          <small className="copyright">© 2026 Filmdappa Media Company</small>
+        </footer>
       </section>
       <section className="login-form-wrap">{children}</section>
     </main>
@@ -33,7 +44,7 @@ function LoginShell({ children }: { children: React.ReactNode }) {
 function SupabaseNotConfigured() {
   return (
     <div className="login-form">
-      <div>
+      <div className="login-form-head">
         <span className="eyebrow">Configuration Required</span>
         <h2>Almost ready</h2>
         <p>One more step before you can log in.</p>
@@ -72,7 +83,7 @@ function EmailStep() {
 
   return (
     <form className="login-form" onSubmit={handleSubmit} noValidate>
-      <div>
+      <div className="login-form-head">
         <span className="eyebrow">Authorized access</span>
         <h2>Secure Login</h2>
         <p>Verify your identity to access Filmdappa CRM</p>
@@ -167,7 +178,7 @@ function OtpStep() {
 
   return (
     <form className="login-form" onSubmit={handleSubmit} noValidate>
-      <div>
+      <div className="login-form-head">
         <span className="eyebrow">Email verification</span>
         <h2>Enter your code</h2>
         <p>
@@ -192,7 +203,6 @@ function OtpStep() {
           autoFocus
           maxLength={OTP_LENGTH}
           disabled={isLoading}
-          style={{ letterSpacing: '0.3em', fontSize: '20px', textAlign: 'center' }}
         />
       </label>
 
