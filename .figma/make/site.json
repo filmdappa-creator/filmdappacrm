@@ -1,0 +1,10 @@
+{
+  "description": "Streamline client and financial management for authorized staff at Filmdappa Media Company with a clean, efficient dashboard for tracking revenue, expenses, and work progress.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
