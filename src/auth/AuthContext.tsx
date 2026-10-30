@@ -15,6 +15,15 @@ export type AuthState = {
   session: Session | null
   user: User | null
   email: string
+  role: 'owner' | 'finance_admin' | 'viewer' | null
+  isOwner: boolean
+  authorizedUser: {
+    id: string
+    email: string
+    role: string
+    full_name: string
+    is_active: boolean
+  } | null
   otpSentAt: number | null        // Unix ms timestamp of last OTP send
   otpAttempts: number             // Failed OTP attempts in current session
   faceVerified: boolean           // Whether presence check passed
@@ -77,6 +86,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     session: null,
     user: null,
     email: '',
+    role: null,
+    isOwner: false,
+    authorizedUser: null,
     otpSentAt: null,
     otpAttempts: 0,
     faceVerified: false,
@@ -92,36 +104,114 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return
     }
 
-    supabase.auth.getSession().then(async ({ data: { session } }) => {
-      if (session && session.user?.email) {
-        try {
-          const { data: authUser, error: authError } = await supabase
-            .from('authorized_users')
-            .select('id, email, is_active')
-            .eq('email', session.user.email)
-            .maybeSingle()
-
-          if (!authError && authUser && authUser.is_active === false) {
-            await supabase.auth.signOut()
-            setState(s => ({ ...s, session: null, user: null, step: 'email', isLoading: false }))
-            return
-          }
-        } catch {
-          // If table check fails, proceed with session
+    const restoreSession = async () => {
+      try {
+        const { data: { session }, error: sessionError } = await supabase.auth.getSession()
+        if (sessionError) {
+          console.error('[Filmdappa Auth] getSession error on mount:', sessionError)
         }
 
+        if (!session) {
+          setState(s => ({ ...s, isLoading: false }))
+          return
+        }
+
+        // Validate session and fetch current authenticated user directly from Supabase Auth
+        const { data: { user }, error: userError } = await supabase.auth.getUser()
+        if (userError || !user) {
+          console.warn('[Filmdappa Auth] getUser returned error or no user:', userError)
+          await supabase.auth.signOut()
+          setState(s => ({ ...s, session: null, user: null, step: 'email', isLoading: false }))
+          return
+        }
+
+        const normalizedEmail = (user.email || session.user?.email || '').trim().toLowerCase()
+        const { data: authUser, error: authError } = await supabase
+          .from('authorized_users')
+          .select('id, email, is_active, role, full_name')
+          .ilike('email', normalizedEmail)
+          .maybeSingle()
+
+        if (authError) {
+          console.error('[Filmdappa Auth] Session restore error querying authorized_users:', {
+            code: authError.code,
+            message: authError.message,
+            details: authError.details,
+            hint: authError.hint,
+          })
+        }
+
+        if (!authError && authUser) {
+          const dbEmail = (authUser.email || '').trim().toLowerCase()
+          if (dbEmail !== normalizedEmail) {
+            console.warn('[Filmdappa Auth] Email casing difference:', { normalizedEmail, dbEmail })
+          }
+
+          if (authUser.is_active === false) {
+            console.warn('[Filmdappa Auth] Deactivated account on session restore:', normalizedEmail)
+            await supabase.auth.signOut()
+            setState(s => ({
+              ...s,
+              session: null,
+              user: null,
+              role: null,
+              isOwner: false,
+              authorizedUser: null,
+              step: 'email',
+              error: 'This account has been deactivated. Contact your administrator.',
+              isLoading: false,
+            }))
+            return
+          }
+
+          const userRole = (authUser.role || '').trim().toLowerCase() as 'owner' | 'finance_admin' | 'viewer'
+          const isOwner = userRole === 'owner'
+
+          setState(s => ({
+            ...s,
+            session,
+            user,
+            email: normalizedEmail,
+            role: userRole,
+            isOwner,
+            authorizedUser: authUser,
+            step: 'authenticated',
+            isLoading: false,
+          }))
+          return
+        } else if (!authError && authUser === null) {
+          console.warn('[Filmdappa Auth] Session restore: email not found in authorized_users:', normalizedEmail)
+          await supabase.auth.signOut()
+          setState(s => ({
+            ...s,
+            session: null,
+            user: null,
+            role: null,
+            isOwner: false,
+            authorizedUser: null,
+            step: 'email',
+            error: `The account "${normalizedEmail}" is not authorized to access Filmdappa CRM.`,
+            isLoading: false,
+          }))
+          return
+        }
+
+        // If table check encountered an error (e.g. RLS or network issue), keep session alive with logging
         setState(s => ({
           ...s,
           session,
-          user: session.user,
-          email: session.user.email ?? '',
+          user,
+          email: normalizedEmail,
           step: 'authenticated',
           isLoading: false,
         }))
-      } else {
+      } catch (err) {
+        console.error('[Filmdappa Auth] Exception during session restore authorization check:', err)
         setState(s => ({ ...s, isLoading: false }))
       }
-    })
+    }
+
+    restoreSession()
 
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!session) {
@@ -129,6 +219,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           ...s,
           session: null,
           user: null,
+          role: null,
+          isOwner: false,
+          authorizedUser: null,
           step: 'email',
           email: '',
           otpSentAt: null,
@@ -163,16 +256,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       try {
         const { data: authUser, error: checkError } = await supabase
           .from('authorized_users')
-          .select('id, email, is_active')
-          .eq('email', trimmed)
+          .select('id, email, is_active, role')
+          .ilike('email', trimmed)
           .maybeSingle()
 
-        if (!checkError && authUser) {
+        if (checkError) {
+          // If RLS denies anon SELECT on authorized_users (expected code 42501 for unauthenticated clients),
+          // log the exact diagnostic information without falsely claiming the account is unauthorized.
+          console.info('[Filmdappa Auth] sendOtp: pre-check on authorized_users info:', {
+            code: checkError.code,
+            message: checkError.message,
+            hint: checkError.hint,
+          })
+        } else if (authUser) {
           if (authUser.is_active === false) {
             throw new Error('This account has been deactivated. Contact your administrator.')
           }
-        } else if (!checkError && authUser === null) {
-          throw new Error('This email is not authorized to access Filmdappa CRM. Contact your administrator.')
         }
       } catch (checkErr) {
         if (
@@ -193,6 +292,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       })
 
       if (error) {
+        console.warn('[Filmdappa Auth] signInWithOtp response error:', error.message)
         // Supabase returns various messages for unregistered/disabled users
         const msg = error.message.toLowerCase()
         if (
@@ -201,7 +301,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           msg.includes('email not confirmed') ||
           msg.includes('invalid login credentials')
         ) {
-          throw new Error('This email is not authorized to access Filmdappa CRM. Contact your administrator.')
+          throw new Error(`The email "${trimmed}" is not registered in Filmdappa CRM. Contact your administrator to invite your account.`)
         }
         // Supabase rate-limit message
         if (msg.includes('for security purposes')) {
@@ -241,8 +341,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setState(s => ({ ...s, isLoading: true, error: null }))
 
     try {
+      const normalizedEmail = state.email.trim().toLowerCase()
       const { data, error } = await supabase.auth.verifyOtp({
-        email: state.email,
+        email: normalizedEmail,
         token: token.trim(),
         type: 'email',
       })
@@ -260,7 +361,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           message = `Incorrect code. ${remaining} attempts remaining.`
         }
 
-        await logAuditEvent('otp_verification_failed', state.email, null, { attempts })
+        await logAuditEvent('otp_verification_failed', normalizedEmail, null, { attempts })
 
         setState(s => ({
           ...s,
@@ -273,45 +374,90 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       }
 
       // ── Verify against public.authorized_users ─────────────────────────────
+      // Normalize user's email from the returned authenticated session or state
+      const userEmail = (data.user?.email || normalizedEmail).trim().toLowerCase()
+      console.log('[Filmdappa Auth] Querying public.authorized_users for authenticated user:', userEmail)
+
       try {
         const { data: authUser, error: authUserError } = await supabase
           .from('authorized_users')
           .select('id, email, is_active, role, full_name')
-          .eq('email', state.email)
+          .ilike('email', userEmail)
           .maybeSingle()
 
-        if (!authUserError && authUser) {
-          if (authUser.is_active === false) {
-            await supabase.auth.signOut()
-            await logAuditEvent('login_denied_inactive', state.email, data.user?.id)
-            throw new Error('This account has been deactivated. Contact your administrator.')
+        if (authUserError) {
+          console.error('[Filmdappa Auth] Error querying public.authorized_users:', {
+            code: authUserError.code,
+            message: authUserError.message,
+            details: authUserError.details,
+            hint: authUserError.hint,
+          })
+
+          // Do NOT treat a database/network/RLS error as an unauthorized account!
+          if (authUserError.code === '42501' || authUserError.message?.toLowerCase().includes('permission denied')) {
+            throw new Error(`Database permission error (PostgreSQL 42501) accessing authorized_users: ${authUserError.message}. Please apply the RLS migration in Supabase SQL Editor.`)
           }
-        } else if (!authUserError && authUser === null) {
-          await supabase.auth.signOut()
-          await logAuditEvent('login_denied_unauthorized', state.email, data.user?.id)
-          throw new Error('This email is not authorized to access Filmdappa CRM. Contact your administrator.')
+          throw new Error(`Database error verifying authorization: ${authUserError.message}`)
         }
+
+        if (authUser === null) {
+          console.warn('[Filmdappa Auth] No record found in public.authorized_users for email:', userEmail)
+          await supabase.auth.signOut()
+          await logAuditEvent('login_denied_unauthorized', userEmail, data.user?.id)
+          throw new Error(`The email "${userEmail}" is not authorized in public.authorized_users. Contact your administrator.`)
+        }
+
+        // Validate is_active
+        if (authUser.is_active !== true) {
+          console.warn('[Filmdappa Auth] Deactivated account attempted login:', userEmail)
+          await supabase.auth.signOut()
+          await logAuditEvent('login_denied_inactive', userEmail, data.user?.id)
+          throw new Error('This account has been deactivated. Contact your administrator.')
+        }
+
+        // Validate role (owner, finance_admin, viewer)
+        const userRole = (authUser.role || '').trim().toLowerCase() as 'owner' | 'finance_admin' | 'viewer'
+        const validRoles = ['owner', 'finance_admin', 'viewer']
+        if (!validRoles.includes(userRole)) {
+          console.warn('[Filmdappa Auth] Invalid role for account:', { userEmail, role: authUser.role })
+          await supabase.auth.signOut()
+          await logAuditEvent('login_denied_invalid_role', userEmail, data.user?.id, { role: authUser.role })
+          throw new Error(`This account has an invalid role ("${authUser.role}"). Contact your administrator.`)
+        }
+
+        const isOwner = userRole === 'owner'
+        console.log(`[Filmdappa Auth] Verification successful: ${userEmail} (role: ${userRole}, isOwner: ${isOwner})`)
+
+        await logAuditEvent('otp_verification_success', userEmail, data.user?.id, { role: userRole })
+
+        // Proceed to authenticated CRM
+        setState(s => ({
+          ...s,
+          session: data.session,
+          user: data.user,
+          email: userEmail,
+          role: userRole,
+          isOwner,
+          authorizedUser: authUser,
+          step: 'authenticated',
+          isLoading: false,
+          error: null,
+          otpAttempts: 0,
+        }))
+        return
       } catch (authCheckErr) {
         if (
           authCheckErr instanceof Error &&
-          (authCheckErr.message.includes('deactivated') || authCheckErr.message.includes('not authorized'))
+          (authCheckErr.message.includes('deactivated') ||
+            authCheckErr.message.includes('not authorized') ||
+            authCheckErr.message.includes('invalid role') ||
+            authCheckErr.message.includes('Database'))
         ) {
           throw authCheckErr
         }
+        console.error('[Filmdappa Auth] Unexpected error in authorization check:', authCheckErr)
+        throw authCheckErr
       }
-
-      await logAuditEvent('otp_verification_success', state.email, data.user?.id)
-
-      // Redirect to the authenticated CRM page
-      setState(s => ({
-        ...s,
-        session: data.session,
-        user: data.user,
-        step: 'authenticated',
-        isLoading: false,
-        error: null,
-        otpAttempts: 0,
-      }))
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Verification failed.'
       setState(s => ({ ...s, isLoading: false, error: message }))
@@ -364,6 +510,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       ...s,
       session: null,
       user: null,
+      role: null,
+      isOwner: false,
+      authorizedUser: null,
       step: 'email',
       faceVerified: false,
       email: '',

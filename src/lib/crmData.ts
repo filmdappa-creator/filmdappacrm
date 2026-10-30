@@ -38,6 +38,7 @@ export interface ExpenseRecord {
   category: string
   description: string
   recipient: string
+  staff_id?: string | null
   client_id?: string | null
   client_name?: string
   amount: number
@@ -46,6 +47,19 @@ export interface ExpenseRecord {
   receipt_reference: string
   notes?: string
   created_at?: string
+}
+
+export function isStaffSalaryExpense(expense: ExpenseRecord): boolean {
+  const cat = (expense.category || '').trim().toLowerCase()
+  return cat === 'staff salary' || cat.includes('salary') || Boolean(expense.staff_id)
+}
+
+export function expenseMatchesStaff(expense: ExpenseRecord, staffMember: StaffRecord): boolean {
+  if (expense.staff_id && expense.staff_id === staffMember.id) return true
+  if (expense.recipient && expense.recipient.trim().toLowerCase() === staffMember.name.trim().toLowerCase()) {
+    return true
+  }
+  return false
 }
 
 export interface StaffRecord {
@@ -131,6 +145,14 @@ function setCached<T>(key: string, data: T): void {
 
 function formatDbError(error: any): string {
   if (!error) return 'An unknown database error occurred.'
+  console.error('[Filmdappa CRM Database Error]', {
+    code: error.code,
+    message: error.message,
+    details: error.details,
+    hint: error.hint,
+  })
+
+  // 1. Missing database table
   if (
     error.code === '42P01' ||
     error.message?.includes('schema cache') ||
@@ -138,9 +160,22 @@ function formatDbError(error: any): string {
   ) {
     return 'Database table does not exist in Supabase yet. Please execute supabase/migrations/002_crm_data_tables.sql in your Supabase SQL Editor.'
   }
-  if (error.code === '42501' || error.message?.includes('permission denied')) {
-    return 'Permission denied: Please ensure you are logged in with an authorized account.'
+
+  // 2. PostgreSQL 42501 Permission Denied (Missing table grant or RLS restriction)
+  if (error.code === '42501' || error.message?.toLowerCase().includes('permission denied')) {
+    const hintText = error.hint ? ` (${error.hint})` : ''
+    return `Database permission denied (PostgreSQL 42501): ${error.message}.${hintText} Please run supabase/migrations/003_fix_authorization_and_rls.sql in your Supabase SQL Editor to grant table privileges to the authenticated role.`
   }
+
+  // 3. Network connection error
+  if (
+    error.message?.includes('Failed to fetch') ||
+    error.message?.includes('NetworkError') ||
+    error.message?.includes('network')
+  ) {
+    return 'Network connection error. Unable to connect to Supabase. Please check your internet connection.'
+  }
+
   return error.message || String(error)
 }
 
@@ -177,6 +212,9 @@ export async function createClient(
   const record: ClientRecord = {
     ...client,
     id,
+    amount: Number(client.amount || 0),
+    videos: Number(client.videos || 0),
+    posters: Number(client.posters || 0),
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   }
@@ -184,8 +222,25 @@ export async function createClient(
   if (!isValidFinancialDate(record.start_date) || !isValidFinancialDate(record.end_date)) {
     throw new Error(`Dates must be between ${MIN_FINANCIAL_DATE} and ${MAX_FINANCIAL_DATE}.`)
   }
+  if (record.start_date > record.end_date) {
+    throw new Error('Agreement start date cannot be after end date.')
+  }
+  if (record.amount < 0) {
+    throw new Error('Monthly package amount cannot be negative.')
+  }
+  if (record.videos < 0) {
+    throw new Error('Videos per month cannot be negative.')
+  }
+  if (record.posters < 0) {
+    throw new Error('Posters per month cannot be negative.')
+  }
 
   if (isSupabaseReady) {
+    const { data: sessionData } = await supabase.auth.getSession()
+    if (!sessionData.session) {
+      throw new Error('Authentication session is missing or expired. Please log in again to save this client.')
+    }
+
     const { data, error } = await supabase.from('clients').insert([record]).select().single()
     if (error) throw new Error(formatDbError(error))
     const saved = data || record
@@ -209,8 +264,16 @@ export async function updateClient(
   if (updates.end_date && !isValidFinancialDate(updates.end_date)) {
     throw new Error(`End date must be between ${MIN_FINANCIAL_DATE} and ${MAX_FINANCIAL_DATE}.`)
   }
+  if (updates.start_date && updates.end_date && updates.start_date > updates.end_date) {
+    throw new Error('Agreement start date cannot be after end date.')
+  }
 
-  const payload = { ...updates, updated_at: new Date().toISOString() }
+  const sanitizedUpdates = { ...updates }
+  if (sanitizedUpdates.amount !== undefined) sanitizedUpdates.amount = Number(sanitizedUpdates.amount || 0)
+  if (sanitizedUpdates.videos !== undefined) sanitizedUpdates.videos = Number(sanitizedUpdates.videos || 0)
+  if (sanitizedUpdates.posters !== undefined) sanitizedUpdates.posters = Number(sanitizedUpdates.posters || 0)
+
+  const payload = { ...sanitizedUpdates, updated_at: new Date().toISOString() }
 
   if (isSupabaseReady) {
     const { data, error } = await supabase
@@ -238,8 +301,15 @@ export async function deleteClient(id: string): Promise<void> {
     const { error } = await supabase.from('clients').delete().eq('id', id)
     if (error) throw new Error(formatDbError(error))
   }
-  const existing = getCached<ClientRecord[]>('clients', [])
-  setCached('clients', existing.filter((c) => c.id !== id))
+  const existingClients = getCached<ClientRecord[]>('clients', [])
+  setCached('clients', existingClients.filter((c) => c.id !== id))
+
+  // Clean up related cached records for local consistency
+  const existingPayments = getCached<ClientPaymentRecord[]>('client_payments', [])
+  setCached('client_payments', existingPayments.filter((p) => p.client_id !== id))
+
+  const existingDeliverables = getCached<DeliverableRecord[]>('deliverables', [])
+  setCached('deliverables', existingDeliverables.filter((d) => d.client_id !== id))
 }
 
 // ─── 2. Client Payments CRUD ────────────────────────────────────────────────
@@ -346,9 +416,27 @@ export async function createExpense(
   }
 
   if (isSupabaseReady) {
+    let saved: ExpenseRecord = record
     const { data, error } = await supabase.from('expenses').insert([record]).select().single()
-    if (error) throw new Error(formatDbError(error))
-    const saved = data || record
+    if (error) {
+      // If error is due to missing staff_id column, retry without staff_id
+      const isMissingStaffCol =
+        error.message?.includes('staff_id') ||
+        error.details?.includes('staff_id') ||
+        error.code === '42703' ||
+        error.code === 'PGRST204'
+
+      if (isMissingStaffCol && 'staff_id' in record) {
+        const { staff_id, ...payloadWithoutStaff } = record
+        const retry = await supabase.from('expenses').insert([payloadWithoutStaff]).select().single()
+        if (retry.error) throw new Error(formatDbError(retry.error))
+        saved = { ...retry.data, staff_id }
+      } else {
+        throw new Error(formatDbError(error))
+      }
+    } else if (data) {
+      saved = data
+    }
     const existing = getCached<ExpenseRecord[]>('expenses', [])
     setCached('expenses', [saved, ...existing.filter((e) => e.id !== saved.id)])
     return saved
@@ -368,6 +456,7 @@ export async function updateExpense(
   }
 
   if (isSupabaseReady) {
+    let updatedData: any = updates
     const { data, error } = await supabase
       .from('expenses')
       .update(updates)
@@ -375,11 +464,34 @@ export async function updateExpense(
       .select()
       .single()
 
-    if (error) throw new Error(formatDbError(error))
+    if (error) {
+      const isMissingStaffCol =
+        error.message?.includes('staff_id') ||
+        error.details?.includes('staff_id') ||
+        error.code === '42703' ||
+        error.code === 'PGRST204'
+
+      if (isMissingStaffCol && 'staff_id' in updates) {
+        const { staff_id, ...updatesWithoutStaff } = updates
+        const retry = await supabase
+          .from('expenses')
+          .update(updatesWithoutStaff)
+          .eq('id', id)
+          .select()
+          .single()
+        if (retry.error) throw new Error(formatDbError(retry.error))
+        updatedData = { ...retry.data, staff_id }
+      } else {
+        throw new Error(formatDbError(error))
+      }
+    } else {
+      updatedData = data
+    }
+
     const existing = getCached<ExpenseRecord[]>('expenses', [])
-    const updated = existing.map((e) => (e.id === id ? { ...e, ...data } : e))
+    const updated = existing.map((e) => (e.id === id ? { ...e, ...updatedData } : e))
     setCached('expenses', updated)
-    return data
+    return updatedData
   }
 
   const existing = getCached<ExpenseRecord[]>('expenses', [])

@@ -25,6 +25,8 @@ import {
   CompanySettings,
   AuditRecord,
   DEFAULT_SETTINGS,
+  isStaffSalaryExpense,
+  expenseMatchesStaff,
   fetchClients,
   createClient,
   updateClient,
@@ -52,10 +54,16 @@ import {
   fetchAuditLogs,
   logCrmAction,
 } from "./lib/crmData"
+import {
+  downloadPdfReport,
+  openPrintableReport,
+  ReportType,
+} from "./lib/pdfReportGenerator"
 
 type Page =
   | "Dashboard"
   | "Clients"
+  | "Add Client"
   | "Expenses"
   | "Staff"
   | "Monthly Reports"
@@ -94,6 +102,105 @@ const nav: { label: Page; icon: IconName }[] = [
   { label: "Audit Logs", icon: "audit" },
   { label: "Settings", icon: "settings" },
 ]
+
+function parseRouteFromUrl(): {
+  page: Page
+  clientId: string | null
+  staffId: string | null
+} {
+  try {
+    const path = (window.location.pathname || "").toLowerCase()
+    const hash = (window.location.hash || "").replace(/^#\/?/, "").toLowerCase()
+    const search = new URLSearchParams(window.location.search || "")
+    const action = (search.get("action") || "").toLowerCase()
+    const pParam = (search.get("page") || "").toLowerCase()
+
+    // 1. Add Client direct routes
+    if (
+      path === "/add-client" ||
+      path === "/clients/new" ||
+      hash === "add-client" ||
+      hash === "clients/new" ||
+      action === "add-client" ||
+      action === "new-client"
+    ) {
+      return { page: "Add Client", clientId: null, staffId: null }
+    }
+
+    // 2. Client Details: /clients/:id or #clients/:id
+    const clientMatch = path.match(/^\/clients\/([^/]+)$/) || hash.match(/^clients\/([^/]+)$/)
+    if (clientMatch && clientMatch[1] !== "new") {
+      return { page: "Clients", clientId: decodeURIComponent(clientMatch[1]), staffId: null }
+    }
+
+    // 3. Staff Details: /staff/:id or #staff/:id
+    const staffMatch = path.match(/^\/staff\/([^/]+)$/) || hash.match(/^staff\/([^/]+)$/)
+    if (staffMatch && staffMatch[1] !== "new") {
+      return { page: "Staff", staffId: decodeURIComponent(staffMatch[1]), clientId: null }
+    }
+
+    // 4. Standalone Pages
+    if (path === "/expenses" || hash === "expenses" || pParam === "expenses") {
+      return { page: "Expenses", clientId: null, staffId: null }
+    }
+    if (path === "/staff" || hash === "staff" || pParam === "staff") {
+      return { page: "Staff", clientId: null, staffId: null }
+    }
+    if (
+      path === "/reports" ||
+      path === "/monthly-reports" ||
+      hash === "reports" ||
+      hash === "monthly-reports" ||
+      pParam === "reports"
+    ) {
+      return { page: "Monthly Reports", clientId: null, staffId: null }
+    }
+    if (path === "/audit" || path === "/audit-logs" || hash === "audit" || hash === "audit-logs" || pParam === "audit") {
+      return { page: "Audit Logs", clientId: null, staffId: null }
+    }
+    if (path === "/settings" || hash === "settings" || pParam === "settings") {
+      return { page: "Settings", clientId: null, staffId: null }
+    }
+    if (path === "/clients" || hash === "clients" || pParam === "clients") {
+      return { page: "Clients", clientId: null, staffId: null }
+    }
+  } catch {
+    // Fallback to Dashboard on any parsing error
+  }
+
+  return { page: "Dashboard", clientId: null, staffId: null }
+}
+
+function updateBrowserUrl(page: Page, clientId?: string | null, staffId?: string | null) {
+  try {
+    let url = "/"
+    if (page === "Add Client") {
+      url = "/clients/new"
+    } else if (clientId) {
+      url = `/clients/${encodeURIComponent(clientId)}`
+    } else if (staffId) {
+      url = `/staff/${encodeURIComponent(staffId)}`
+    } else if (page === "Clients") {
+      url = "/clients"
+    } else if (page === "Expenses") {
+      url = "/expenses"
+    } else if (page === "Staff") {
+      url = "/staff"
+    } else if (page === "Monthly Reports") {
+      url = "/reports"
+    } else if (page === "Audit Logs") {
+      url = "/audit-logs"
+    } else if (page === "Settings") {
+      url = "/settings"
+    }
+
+    if (window.location.pathname !== url && window.location.hash !== `#${url}`) {
+      window.history.pushState({ page, clientId, staffId }, "", url)
+    }
+  } catch {
+    // Browser environment fallback
+  }
+}
 
 function getGreeting(): string {
   const hour = new Date().getHours()
@@ -249,6 +356,7 @@ function Button({
   type = "button",
   icon,
   disabled = false,
+  title,
 }: {
   children: ReactNode
   onClick?: () => void
@@ -256,12 +364,14 @@ function Button({
   type?: "button" | "submit"
   icon?: IconName
   disabled?: boolean
+  title?: string
 }) {
   return (
     <button
       type={type}
       onClick={onClick}
       disabled={disabled}
+      title={title}
       className={`btn btn-${variant}`}
     >
       {icon && <Icon name={icon} size={16} />}
@@ -288,6 +398,8 @@ function Field({
   onChange,
   min,
   max,
+  isTextArea = false,
+  rows = 3,
 }: {
   label: string
   placeholder?: string
@@ -297,19 +409,45 @@ function Field({
   onChange?: (val: string) => void
   min?: string | number
   max?: string | number
+  isTextArea?: boolean
+  rows?: number
 }) {
   return (
-    <label className="field">
-      <span>{label}</span>
-      <input
-        type={type}
-        placeholder={placeholder}
-        required={required}
-        value={value}
-        onChange={(e) => onChange && onChange(e.target.value)}
-        min={min}
-        max={max}
-      />
+    <label className={`field ${isTextArea ? "field-full" : ""}`}>
+      <span>
+        {label}
+        {required && <span className="required-star">*</span>}
+      </span>
+      {isTextArea ? (
+        <textarea
+          placeholder={placeholder}
+          required={required}
+          value={value ?? ""}
+          rows={rows}
+          onChange={(e) => onChange && onChange(e.target.value)}
+          style={{
+            width: "100%",
+            padding: "10px 12px",
+            border: "1px solid var(--line)",
+            borderRadius: 8,
+            outline: 0,
+            background: "var(--white)",
+            fontSize: 11,
+            fontFamily: "inherit",
+            resize: "vertical",
+          }}
+        />
+      ) : (
+        <input
+          type={type}
+          placeholder={placeholder}
+          required={required}
+          value={value ?? ""}
+          onChange={(e) => onChange && onChange(e.target.value)}
+          min={min}
+          max={max}
+        />
+      )}
     </label>
   )
 }
@@ -319,18 +457,24 @@ function SelectField({
   options,
   value,
   onChange,
+  required = false,
 }: {
   label: string
   options: { label: string; value: string }[] | string[]
   value?: string
   onChange?: (val: string) => void
+  required?: boolean
 }) {
   return (
     <label className="field">
-      <span>{label}</span>
+      <span>
+        {label}
+        {required && <span className="required-star">*</span>}
+      </span>
       <select
-        value={value}
+        value={value ?? ""}
         onChange={(e) => onChange && onChange(e.target.value)}
+        required={required}
       >
         {options.map((opt) => {
           const val = typeof opt === "string" ? opt : opt.value
@@ -443,13 +587,15 @@ function MonthNavigator({
 
 function CashFlowChart({
   selectedMonth,
-  payments,
-  expenses,
+  payments = [],
+  expenses = [],
+  staffPayments = [],
   currency,
 }: {
   selectedMonth: string
   payments: ClientPaymentRecord[]
   expenses: ExpenseRecord[]
+  staffPayments?: StaffPaymentRecord[]
   currency: string
 }) {
   const curIdx = FINANCIAL_MONTHS.findIndex((m) => m.key === selectedMonth)
@@ -460,9 +606,23 @@ function CashFlowChart({
     const inc = payments
       .filter((p) => dateIsInMonth(p.payment_date, m.key))
       .reduce((sum, p) => sum + Number(p.amount || 0), 0)
-    const exp = expenses
+    const ledgerExp = expenses
       .filter((e) => dateIsInMonth(e.date, m.key))
       .reduce((sum, e) => sum + Number(e.amount || 0), 0)
+    const legacyExp = staffPayments
+      .filter(
+        (sp) =>
+          dateIsInMonth(sp.payment_date, m.key) &&
+          !expenses.some(
+            (e) =>
+              e.id === sp.id ||
+              (e.date === sp.payment_date &&
+                Number(e.amount) === Number(sp.amount) &&
+                isStaffSalaryExpense(e)),
+          ),
+      )
+      .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+    const exp = ledgerExp + legacyExp
     return { month: m.shortMonth, income: inc, expense: exp }
   })
 
@@ -523,10 +683,10 @@ function Dashboard({
   openPage,
   selectedMonth,
   onMonthChange,
-  clients,
-  payments,
-  expenses,
-  staffPayments,
+  clients = [],
+  payments = [],
+  expenses = [],
+  staffPayments = [],
   currency,
   userName,
 }: {
@@ -555,44 +715,78 @@ function Dashboard({
     0,
   )
 
+  // Total Income = Actual cash received from clients in the selected month
   const monthPayments = payments.filter((p) =>
     dateIsInMonth(p.payment_date, selectedMonth),
   )
-  const totalReceived = monthPayments.reduce(
+  const totalIncome = monthPayments.reduce(
     (sum, p) => sum + Number(p.amount || 0),
     0,
   )
+  const totalReceived = totalIncome
 
-  const pendingPayments = Math.max(0, totalClientRevenue - totalReceived)
+  const pendingPayments = Math.max(0, totalClientRevenue - totalIncome)
 
+  // Expenses recorded in the ledger for this month (including operating costs and Staff Salary)
   const monthExpenses = expenses.filter((e) =>
     dateIsInMonth(e.date, selectedMonth),
   )
-  const totalExpenses = monthExpenses.reduce(
+  const totalExpensesFromLedger = monthExpenses.reduce(
     (sum, e) => sum + Number(e.amount || 0),
     0,
   )
 
-  const monthStaffPayments = staffPayments.filter((sp) =>
-    dateIsInMonth(sp.payment_date, selectedMonth),
+  // Legacy staff payments: count only if not already tracked in the expenses ledger
+  const legacyMonthStaffPayments = staffPayments.filter(
+    (sp) =>
+      dateIsInMonth(sp.payment_date, selectedMonth) &&
+      !expenses.some(
+        (e) =>
+          e.id === sp.id ||
+          (e.date === sp.payment_date &&
+            Number(e.amount) === Number(sp.amount) &&
+            isStaffSalaryExpense(e)),
+      ),
   )
-  const staffPaid = monthStaffPayments
-    .filter((sp) => sp.status === "Paid")
-    .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
-  const staffPending = monthStaffPayments
-    .filter((sp) => sp.status === "Pending")
-    .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
-  const totalStaffPayments = staffPaid + staffPending
+  const legacyStaffTotal = legacyMonthStaffPayments.reduce(
+    (sum, sp) => sum + Number(sp.amount || 0),
+    0,
+  )
 
-  const estimatedProfit = totalReceived - totalExpenses
+  // Total Expenses includes Staff Salary exactly once
+  const totalExpenses = totalExpensesFromLedger + legacyStaffTotal
+
+  // Net Income = Total Income − Total Expenses
+  const netIncome = totalIncome - totalExpenses
+
   const profitMargin =
-    totalReceived > 0
-      ? ((estimatedProfit / totalReceived) * 100).toFixed(1) + "% margin"
+    totalIncome > 0
+      ? ((netIncome / totalIncome) * 100).toFixed(1) + "% margin"
       : "0% margin"
+
+  // Staff Salary & compensation metrics
+  const staffSalaryExpenses = monthExpenses.filter((e) => isStaffSalaryExpense(e))
+  const staffPaid =
+    staffSalaryExpenses
+      .filter((e) => e.status === "Paid")
+      .reduce((sum, e) => sum + Number(e.amount || 0), 0) +
+    legacyMonthStaffPayments
+      .filter((sp) => sp.status === "Paid")
+      .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+
+  const staffPending =
+    staffSalaryExpenses
+      .filter((e) => e.status === "Pending")
+      .reduce((sum, e) => sum + Number(e.amount || 0), 0) +
+    legacyMonthStaffPayments
+      .filter((sp) => sp.status === "Pending")
+      .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+
+  const totalStaffSalary = staffPaid + staffPending
 
   const collectionRate =
     totalClientRevenue > 0
-      ? Math.min(100, Math.round((totalReceived / totalClientRevenue) * 100))
+      ? Math.min(100, Math.round((totalIncome / totalClientRevenue) * 100))
       : 0
 
   const summaries = [
@@ -604,7 +798,7 @@ function Dashboard({
     ],
     [
       "Total Amount Received",
-      formatMoney(totalReceived, currency),
+      formatMoney(totalIncome, currency),
       `${collectionRate}% collected`,
       "check",
     ],
@@ -617,19 +811,19 @@ function Dashboard({
     [
       "Total Expenses",
       formatMoney(totalExpenses, currency),
-      `${currentMonthInfo.shortMonth} operating cost`,
+      `${currentMonthInfo.shortMonth} operating & salary costs`,
       "expenses",
     ],
     [
-      "Staff Payments",
-      formatMoney(totalStaffPayments, currency),
+      "Staff Salaries & Payments",
+      formatMoney(totalStaffSalary, currency),
       `${formatMoney(staffPending, currency)} pending`,
       "staff",
     ],
     [
-      "Estimated Profit",
-      formatMoney(estimatedProfit, currency),
-      profitMargin,
+      "Net Income",
+      formatMoney(netIncome, currency),
+      `${profitMargin} · Net Income = Total Income − Total Expenses`,
       "wallet",
     ],
   ] as const
@@ -721,6 +915,7 @@ function Dashboard({
             selectedMonth={selectedMonth}
             payments={payments}
             expenses={expenses}
+            staffPayments={staffPayments}
             currency={currency}
           />
         </article>
@@ -797,16 +992,266 @@ function Dashboard({
   )
 }
 
+// ─── Add Client Page Component ──────────────────────────────────────────────
+
+function AddClientPage({
+  onCancel,
+  onClientCreated,
+  currency,
+  selectedMonth,
+}: {
+  onCancel: () => void
+  onClientCreated: (client: ClientRecord) => void
+  currency: string
+  selectedMonth: string
+}) {
+  const currentMonthInfo = getMonthByKey(selectedMonth)
+  const defaultDate = `${selectedMonth}-01`
+
+  const [cName, setCName] = useState("")
+  const [cBusiness, setCBusiness] = useState("")
+  const [cPhone, setCPhone] = useState("+91 ")
+  const [cAmount, setCAmount] = useState("")
+  const [cVideos, setCVideos] = useState("")
+  const [cPosters, setCPosters] = useState("")
+  const [cStart, setCStart] = useState(defaultDate)
+  const [cEnd, setCEnd] = useState(currentMonthInfo.endDate)
+  const [cStatus, setCStatus] = useState<"Active" | "Ending soon" | "Inactive">("Active")
+  const [cNotes, setCNotes] = useState("")
+
+  const [err, setErr] = useState("")
+  const [submitting, setSubmitting] = useState(false)
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault()
+    if (submitting) return
+
+    setErr("")
+
+    // Comprehensive validations
+    if (!cName.trim()) {
+      setErr("Client contact name is required.")
+      return
+    }
+    if (!cBusiness.trim()) {
+      setErr("Business / company name is required.")
+      return
+    }
+    if (!isValidFinancialDate(cStart)) {
+      setErr(`Start date must be between ${MIN_FINANCIAL_DATE} and ${MAX_FINANCIAL_DATE}.`)
+      return
+    }
+    if (!isValidFinancialDate(cEnd)) {
+      setErr(`End date must be between ${MIN_FINANCIAL_DATE} and ${MAX_FINANCIAL_DATE}.`)
+      return
+    }
+    if (cStart > cEnd) {
+      setErr("Agreement start date cannot be after the end date.")
+      return
+    }
+
+    const amt = parseFloat(cAmount) || 0
+    if (amt < 0) {
+      setErr("Monthly package amount cannot be negative.")
+      return
+    }
+
+    const vids = parseInt(cVideos, 10) || 0
+    if (vids < 0) {
+      setErr("Videos per month cannot be negative.")
+      return
+    }
+
+    const posts = parseInt(cPosters, 10) || 0
+    if (posts < 0) {
+      setErr("Posters per month cannot be negative.")
+      return
+    }
+
+    setSubmitting(true)
+    try {
+      const newClient = await createClient({
+        name: cName.trim(),
+        business: cBusiness.trim(),
+        phone: cPhone.trim(),
+        amount: amt,
+        videos: vids,
+        posters: posts,
+        start_date: cStart,
+        end_date: cEnd,
+        status: cStatus,
+        notes: cNotes.trim(),
+      })
+      await logCrmAction(
+        "User",
+        "Client Added",
+        `Registered client: ${cBusiness.trim()}`,
+        formatMoney(amt, currency),
+      )
+      onClientCreated(newClient)
+    } catch (error: any) {
+      setErr(error?.message || "Failed to create client in Supabase.")
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <>
+      <button className="back-link" onClick={onCancel} type="button">
+        ‹ Back to clients
+      </button>
+
+      <PageHeader
+        eyebrow="Client Management"
+        title="Add New Client"
+        description="Register a new client package agreement with billing and deliverable targets in Supabase."
+        action={
+          <Button variant="outline" onClick={onCancel} disabled={submitting}>
+            Cancel
+          </Button>
+        }
+      />
+
+      <div style={{ maxWidth: 840 }}>
+        <section className="panel">
+          <div className="panel-heading">
+            <div>
+              <h2>Client Agreement Information</h2>
+              <p>Fields marked with an asterisk (*) are required.</p>
+            </div>
+            <Status>{cStatus}</Status>
+          </div>
+
+          {err && (
+            <div
+              style={{
+                padding: "12px 16px",
+                marginBottom: 20,
+                background: "#fee2e2",
+                border: "1px solid #fca5a5",
+                color: "#b91c1c",
+                borderRadius: 9,
+                fontSize: 13,
+                lineHeight: 1.5,
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+              }}
+              role="alert"
+            >
+              <strong>Error:</strong>
+              <span>{err}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="form-grid">
+            <Field
+              label="Client contact name"
+              placeholder="e.g. Rahul Sharma"
+              value={cName}
+              onChange={setCName}
+              required
+            />
+            <Field
+              label="Business / company name"
+              placeholder="e.g. Northstar Media"
+              value={cBusiness}
+              onChange={setCBusiness}
+              required
+            />
+            <Field
+              label="Phone number"
+              placeholder="+91 98765 43210"
+              value={cPhone}
+              onChange={setCPhone}
+            />
+            <Field
+              label="Monthly package amount (₹)"
+              type="number"
+              placeholder="0"
+              value={cAmount}
+              onChange={setCAmount}
+              required
+              min={0}
+            />
+            <Field
+              label="Videos per month"
+              type="number"
+              placeholder="0"
+              value={cVideos}
+              onChange={setCVideos}
+              min={0}
+            />
+            <Field
+              label="Posters per month"
+              type="number"
+              placeholder="0"
+              value={cPosters}
+              onChange={setCPosters}
+              min={0}
+            />
+            <Field
+              label="Agreement start date"
+              type="date"
+              value={cStart}
+              onChange={setCStart}
+              min={MIN_FINANCIAL_DATE}
+              max={MAX_FINANCIAL_DATE}
+              required
+            />
+            <Field
+              label="Agreement end date"
+              type="date"
+              value={cEnd}
+              onChange={setCEnd}
+              min={MIN_FINANCIAL_DATE}
+              max={MAX_FINANCIAL_DATE}
+              required
+            />
+            <SelectField
+              label="Account status"
+              value={cStatus}
+              options={["Active", "Ending soon", "Inactive"]}
+              onChange={(val) =>
+                setCStatus(val as "Active" | "Ending soon" | "Inactive")
+              }
+            />
+            <Field
+              label="Notes / Project details (optional)"
+              placeholder="Important project notes, deliverable scope or custom terms"
+              value={cNotes}
+              onChange={setCNotes}
+              isTextArea
+              rows={3}
+            />
+
+            <div className="form-actions">
+              <Button variant="outline" onClick={onCancel} disabled={submitting}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={submitting}>
+                {submitting ? "Saving to Supabase..." : "Create Client"}
+              </Button>
+            </div>
+          </form>
+        </section>
+      </div>
+    </>
+  )
+}
+
 // ─── Clients Page Component ─────────────────────────────────────────────────
 
 function Clients({
   clients,
   openClient,
+  openAddClient,
   openModal,
   currency,
 }: {
   clients: ClientRecord[]
   openClient: (id: string) => void
+  openAddClient: () => void
   openModal: (type: string) => void
   currency: string
 }) {
@@ -814,7 +1259,7 @@ function Clients({
   const [statusFilter, setStatusFilter] = useState("All statuses")
 
   const filtered = clients.filter((c) => {
-    const matchesQuery = `${c.name} ${c.business}`
+    const matchesQuery = `${c.name || ""} ${c.business || ""}`
       .toLowerCase()
       .includes(query.toLowerCase())
     const matchesStatus =
@@ -829,7 +1274,7 @@ function Clients({
         title="Clients"
         description="Manage packages, payments and monthly deliverables."
         action={
-          <Button icon="plus" onClick={() => openModal("client")}>
+          <Button icon="plus" onClick={openAddClient}>
             Add client
           </Button>
         }
@@ -858,9 +1303,14 @@ function Clients({
           <Icon name="clients" size={32} />
           <strong>No clients added yet</strong>
           <p>
-            Click "Add client" above to create your first client agreement in
+            Click "Add client" to create your first client agreement in
             Supabase.
           </p>
+          <div style={{ marginTop: 12 }}>
+            <Button icon="plus" onClick={openAddClient}>
+              Add client
+            </Button>
+          </div>
         </div>
       ) : (
         <section className="client-grid">
@@ -1506,28 +1956,126 @@ function Expenses({
 function Staff({
   staff,
   staffPayments,
+  expenses,
   selectedMonth,
+  onMonthChange,
   openStaff,
   openModal,
+  onDeleteExpense,
+  onDeleteStaffPayment,
   currency,
 }: {
   staff: StaffRecord[]
   staffPayments: StaffPaymentRecord[]
+  expenses: ExpenseRecord[]
   selectedMonth: string
+  onMonthChange: (monthKey: string) => void
   openStaff: (id: string) => void
-  openModal: (type: string) => void
+  openModal: (type: string, staffId?: string, initialData?: any) => void
+  onDeleteExpense: (id: string) => Promise<void>
+  onDeleteStaffPayment: (id: string) => Promise<void>
   currency: string
 }) {
+  const currentMonthInfo = getMonthByKey(selectedMonth)
+
+  // Combined salary expense records for the selected month
+  const monthSalaryRecords = useMemo(() => {
+    const list: {
+      id: string
+      date: string
+      staffId?: string
+      staffName: string
+      role?: string
+      description: string
+      clientName?: string
+      paymentMethod: string
+      reference: string
+      status: "Paid" | "Pending"
+      notes?: string
+      amount: number
+      isExpense: boolean
+      rawExpense?: ExpenseRecord
+      onDelete: () => Promise<void>
+    }[] = []
+
+    // Expenses with category "Staff Salary" or linked to staff
+    expenses
+      .filter((e) => isStaffSalaryExpense(e) && dateIsInMonth(e.date, selectedMonth))
+      .forEach((e) => {
+        const matched = staff.find((s) => expenseMatchesStaff(e, s))
+        list.push({
+          id: e.id,
+          date: e.date,
+          staffId: matched?.id || e.staff_id || undefined,
+          staffName: matched?.name || e.recipient || "Staff (Unassigned)",
+          role: matched?.role,
+          description: e.description || `${e.category} expense`,
+          clientName: e.client_name,
+          paymentMethod: e.payment_method || "Bank transfer",
+          reference: e.receipt_reference || "",
+          status: e.status,
+          notes: e.notes,
+          amount: Number(e.amount || 0),
+          isExpense: true,
+          rawExpense: e,
+          onDelete: () => onDeleteExpense(e.id),
+        })
+      })
+
+    // Legacy staff payments not duplicated in expenses
+    staffPayments
+      .filter(
+        (sp) =>
+          dateIsInMonth(sp.payment_date, selectedMonth) &&
+          !expenses.some((e) => e.id === sp.id),
+      )
+      .forEach((sp) => {
+        const matched = staff.find((s) => s.id === sp.staff_id)
+        list.push({
+          id: sp.id,
+          date: sp.payment_date,
+          staffId: sp.staff_id,
+          staffName: matched?.name || sp.staff_name || "Staff",
+          role: matched?.role,
+          description: sp.work_description || `${sp.payment_type} payment`,
+          clientName: sp.related_client,
+          paymentMethod: sp.payment_method || "Bank transfer",
+          reference: sp.reference || "",
+          status: sp.status,
+          notes: "",
+          amount: Number(sp.amount || 0),
+          isExpense: false,
+          onDelete: () => onDeleteStaffPayment(sp.id),
+        })
+      })
+
+    return list.sort((a, b) => b.date.localeCompare(a.date))
+  }, [expenses, staffPayments, staff, selectedMonth, onDeleteExpense, onDeleteStaffPayment])
+
   return (
     <>
       <PageHeader
         eyebrow="Team management"
         title="Staff"
-        description="Manage team profiles, roles and payment records."
+        description="Manage team profiles, roles and salary expense records."
         action={
-          <Button icon="plus" onClick={() => openModal("staff")}>
-            Add staff
-          </Button>
+          <div className="button-row">
+            <Button
+              variant="outline"
+              icon="plus"
+              onClick={() =>
+                openModal("expense", undefined, {
+                  category: "Staff Salary",
+                  description: "Monthly staff salary",
+                })
+              }
+            >
+              Record salary expense
+            </Button>
+            <Button icon="plus" onClick={() => openModal("staff")}>
+              Add staff
+            </Button>
+          </div>
         }
       />
 
@@ -1548,17 +2096,34 @@ function Staff({
                 .join("")
                 .toUpperCase() || "ST"
 
-            const pPayments = staffPayments.filter(
+            const pSalaryExpenses = expenses.filter(
+              (e) =>
+                isStaffSalaryExpense(e) &&
+                expenseMatchesStaff(e, person) &&
+                dateIsInMonth(e.date, selectedMonth),
+            )
+            const pLegacyPayments = staffPayments.filter(
               (sp) =>
                 sp.staff_id === person.id &&
-                dateIsInMonth(sp.payment_date, selectedMonth),
+                dateIsInMonth(sp.payment_date, selectedMonth) &&
+                !expenses.some((e) => e.id === sp.id),
             )
-            const paidMonth = pPayments
-              .filter((sp) => sp.status === "Paid")
-              .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
-            const pendingMonth = pPayments
-              .filter((sp) => sp.status === "Pending")
-              .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+
+            const paidMonth =
+              pSalaryExpenses
+                .filter((e) => e.status === "Paid")
+                .reduce((sum, e) => sum + Number(e.amount || 0), 0) +
+              pLegacyPayments
+                .filter((sp) => sp.status === "Paid")
+                .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+
+            const pendingMonth =
+              pSalaryExpenses
+                .filter((e) => e.status === "Pending")
+                .reduce((sum, e) => sum + Number(e.amount || 0), 0) +
+              pLegacyPayments
+                .filter((sp) => sp.status === "Pending")
+                .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
 
             return (
               <button
@@ -1599,6 +2164,117 @@ function Staff({
           })}
         </section>
       )}
+
+      {/* Staff Salary & Expense Records Ledger */}
+      <section className="panel" style={{ marginTop: "24px" }}>
+        <div className="panel-heading">
+          <div>
+            <h2>Staff Salary & Expense Records</h2>
+            <p>
+              Salary and compensation expenses recorded in the financial ledger for{" "}
+              {currentMonthInfo.label}.
+            </p>
+          </div>
+          <div className="button-row">
+            <MonthNavigator
+              selectedMonth={selectedMonth}
+              onChange={onMonthChange}
+            />
+          </div>
+        </div>
+
+        {monthSalaryRecords.length === 0 ? (
+          <div className="empty-box">
+            <Icon name="staff" size={28} />
+            <strong>No staff salary expenses recorded for this month</strong>
+            <p>
+              Click "Record salary expense" above or add an expense under category
+              "Staff Salary" to track compensation in Supabase.
+            </p>
+          </div>
+        ) : (
+          <div className="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Staff member</th>
+                  <th>Description</th>
+                  <th>Payment method & ref</th>
+                  <th>Status</th>
+                  <th>Notes</th>
+                  <th>Amount</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {monthSalaryRecords.map((rec) => (
+                  <tr key={rec.id}>
+                    <td>{formatDateDisplay(rec.date)}</td>
+                    <td>
+                      <b>{rec.staffName}</b>
+                      {rec.role && (
+                        <small style={{ display: "block", color: "var(--text-muted)" }}>
+                          {rec.role}
+                        </small>
+                      )}
+                    </td>
+                    <td>
+                      <span>{rec.description}</span>
+                      {rec.clientName && rec.clientName !== "—" && (
+                        <small style={{ display: "block", color: "var(--text-muted)" }}>
+                          Project: {rec.clientName}
+                        </small>
+                      )}
+                    </td>
+                    <td>
+                      {rec.paymentMethod}
+                      {rec.reference ? ` · ${rec.reference}` : ""}
+                    </td>
+                    <td>
+                      <Status>{rec.status}</Status>
+                    </td>
+                    <td>
+                      {rec.notes ? (
+                        <span style={{ fontSize: "13px", color: "var(--accent-gold)" }}>
+                          {rec.notes}
+                        </span>
+                      ) : (
+                        <span style={{ color: "var(--text-muted)" }}>—</span>
+                      )}
+                    </td>
+                    <td>
+                      <b>{formatMoney(rec.amount, currency)}</b>
+                    </td>
+                    <td>
+                      <div className="row-actions">
+                        {rec.isExpense && (
+                          <button
+                            className="action-btn"
+                            title="Edit salary expense"
+                            onClick={() =>
+                              openModal("expense", rec.staffId, rec.rawExpense)
+                            }
+                          >
+                            <Icon name="edit" size={14} />
+                          </button>
+                        )}
+                        <button
+                          className="action-btn danger"
+                          title="Delete salary record"
+                          onClick={() => rec.onDelete()}
+                        >
+                          <Icon name="trash" size={14} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </>
   )
 }
@@ -1609,21 +2285,25 @@ function StaffDetails({
   id,
   staff,
   staffPayments,
+  expenses,
   selectedMonth,
   back,
   openModal,
   onDeleteStaff,
   onDeleteStaffPayment,
+  onDeleteExpense,
   currency,
 }: {
   id: string
   staff: StaffRecord[]
   staffPayments: StaffPaymentRecord[]
+  expenses: ExpenseRecord[]
   selectedMonth: string
   back: () => void
   openModal: (type: string, staffId?: string, initialData?: any) => void
   onDeleteStaff: (id: string, name: string) => Promise<void>
   onDeleteStaffPayment: (id: string) => Promise<void>
+  onDeleteExpense: (id: string) => Promise<void>
   currency: string
 }) {
   const person = staff.find((s) => s.id === id)
@@ -1641,16 +2321,77 @@ function StaffDetails({
     )
   }
 
-  const pPayments = staffPayments.filter((sp) => sp.staff_id === person.id)
-  const paidThisMonth = pPayments
-    .filter(
-      (sp) =>
-        dateIsInMonth(sp.payment_date, selectedMonth) && sp.status === "Paid",
-    )
-    .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
-  const totalPending = pPayments
-    .filter((sp) => sp.status === "Pending")
-    .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+  // Unified salary and payment history for this person
+  const personRecords = useMemo(() => {
+    const list: {
+      id: string
+      date: string
+      type: string
+      relatedClient: string
+      description: string
+      paymentMethod: string
+      reference: string
+      status: "Paid" | "Pending"
+      notes?: string
+      amount: number
+      isExpense: boolean
+      rawExpense?: ExpenseRecord
+      onDelete: () => Promise<void>
+    }[] = []
+
+    // Expenses matching this staff member
+    expenses
+      .filter((e) => isStaffSalaryExpense(e) && expenseMatchesStaff(e, person))
+      .forEach((e) => {
+        list.push({
+          id: e.id,
+          date: e.date,
+          type: e.category,
+          relatedClient: e.client_name || "Company operations",
+          description: e.description || `${e.category} expense`,
+          paymentMethod: e.payment_method || "Bank transfer",
+          reference: e.receipt_reference || "",
+          status: e.status,
+          notes: e.notes,
+          amount: Number(e.amount || 0),
+          isExpense: true,
+          rawExpense: e,
+          onDelete: () => onDeleteExpense(e.id),
+        })
+      })
+
+    // Legacy staff payments
+    staffPayments
+      .filter(
+        (sp) => sp.staff_id === person.id && !expenses.some((e) => e.id === sp.id),
+      )
+      .forEach((sp) => {
+        list.push({
+          id: sp.id,
+          date: sp.payment_date,
+          type: sp.payment_type,
+          relatedClient: sp.related_client || "Company operations",
+          description: sp.work_description || `${sp.payment_type} payment`,
+          paymentMethod: sp.payment_method || "Bank transfer",
+          reference: sp.reference || "",
+          status: sp.status,
+          notes: "",
+          amount: Number(sp.amount || 0),
+          isExpense: false,
+          onDelete: () => onDeleteStaffPayment(sp.id),
+        })
+      })
+
+    return list.sort((a, b) => b.date.localeCompare(a.date))
+  }, [expenses, staffPayments, person, onDeleteExpense, onDeleteStaffPayment])
+
+  const paidThisMonth = personRecords
+    .filter((r) => dateIsInMonth(r.date, selectedMonth) && r.status === "Paid")
+    .reduce((sum, r) => sum + r.amount, 0)
+
+  const totalPending = personRecords
+    .filter((r) => r.status === "Pending")
+    .reduce((sum, r) => sum + r.amount, 0)
 
   return (
     <>
@@ -1679,9 +2420,17 @@ function StaffDetails({
             </Button>
             <Button
               icon="plus"
-              onClick={() => openModal("staff payment", person.id)}
+              onClick={() =>
+                openModal("expense", person.id, {
+                  category: "Staff Salary",
+                  recipient: person.name,
+                  staff_id: person.id,
+                  amount: person.salary > 0 ? person.salary : undefined,
+                  description: `${person.name} — Monthly salary`,
+                })
+              }
             >
-              Record payment
+              Record salary / payment
             </Button>
           </div>
         }
@@ -1709,14 +2458,14 @@ function StaffDetails({
       <section className="panel">
         <div className="panel-heading">
           <div>
-            <h2>Payment history</h2>
-            <p>Payments recorded for this staff member in Supabase.</p>
+            <h2>Payment & Salary history</h2>
+            <p>Compensation records for this staff member in Supabase.</p>
           </div>
         </div>
 
-        {pPayments.length === 0 ? (
+        {personRecords.length === 0 ? (
           <div className="empty-box">
-            <p>No payment records for this staff member yet.</p>
+            <p>No payment or salary records for this staff member yet.</p>
           </div>
         ) : (
           <div className="table-wrap">
@@ -1726,37 +2475,60 @@ function StaffDetails({
                   <th>Payment date</th>
                   <th>Type</th>
                   <th>Related client / project</th>
-                  <th>Work description</th>
+                  <th>Description</th>
                   <th>Method & reference</th>
                   <th>Status</th>
+                  <th>Notes</th>
                   <th>Amount</th>
                   <th>Action</th>
                 </tr>
               </thead>
               <tbody>
-                {pPayments.map((sp) => (
-                  <tr key={sp.id}>
-                    <td>{formatDateDisplay(sp.payment_date)}</td>
-                    <td>{sp.payment_type}</td>
-                    <td>{sp.related_client}</td>
-                    <td>{sp.work_description || "—"}</td>
+                {personRecords.map((r) => (
+                  <tr key={r.id}>
+                    <td>{formatDateDisplay(r.date)}</td>
+                    <td>{r.type}</td>
+                    <td>{r.relatedClient}</td>
+                    <td>{r.description || "—"}</td>
                     <td>
-                      {sp.payment_method} · {sp.reference || "No ref"}
+                      {r.paymentMethod} · {r.reference || "No ref"}
                     </td>
                     <td>
-                      <Status>{sp.status}</Status>
+                      <Status>{r.status}</Status>
                     </td>
                     <td>
-                      <b>{formatMoney(sp.amount, currency)}</b>
+                      {r.notes ? (
+                        <span style={{ fontSize: "13px", color: "var(--accent-gold)" }}>
+                          {r.notes}
+                        </span>
+                      ) : (
+                        <span style={{ color: "var(--text-muted)" }}>—</span>
+                      )}
                     </td>
                     <td>
-                      <button
-                        className="action-btn danger"
-                        title="Delete staff payment"
-                        onClick={() => onDeleteStaffPayment(sp.id)}
-                      >
-                        <Icon name="trash" size={14} />
-                      </button>
+                      <b>{formatMoney(r.amount, currency)}</b>
+                    </td>
+                    <td>
+                      <div className="row-actions">
+                        {r.isExpense && (
+                          <button
+                            className="action-btn"
+                            title="Edit salary expense"
+                            onClick={() =>
+                              openModal("expense", person.id, r.rawExpense)
+                            }
+                          >
+                            <Icon name="edit" size={14} />
+                          </button>
+                        )}
+                        <button
+                          className="action-btn danger"
+                          title="Delete payment record"
+                          onClick={() => r.onDelete()}
+                        >
+                          <Icon name="trash" size={14} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -1780,6 +2552,7 @@ function Reports({
   staff,
   staffPayments,
   currency,
+  settings,
 }: {
   selectedMonth: string
   onMonthChange: (monthKey: string) => void
@@ -1789,7 +2562,11 @@ function Reports({
   staff: StaffRecord[]
   staffPayments: StaffPaymentRecord[]
   currency: string
+  settings?: CompanySettings
 }) {
+  const [reportType, setReportType] = useState<ReportType>("comprehensive")
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState(false)
+
   const monthInfo = getMonthByKey(selectedMonth)
 
   const activeClients = clients.filter(
@@ -1816,43 +2593,122 @@ function Reports({
   const monthExpenses = expenses.filter((e) =>
     dateIsInMonth(e.date, selectedMonth),
   )
-  const totalOperatingExpenses = monthExpenses.reduce(
-    (sum, e) => sum + Number(e.amount || 0),
+
+  const legacyMonthStaffPayments = staffPayments.filter(
+    (sp) =>
+      dateIsInMonth(sp.payment_date, selectedMonth) &&
+      !expenses.some(
+        (e) =>
+          e.id === sp.id ||
+          (e.date === sp.payment_date &&
+            Number(e.amount) === Number(sp.amount) &&
+            isStaffSalaryExpense(e)),
+      ),
+  )
+  const legacyStaffTotal = legacyMonthStaffPayments.reduce(
+    (sum, sp) => sum + Number(sp.amount || 0),
     0,
   )
 
-  const monthStaffPayments = staffPayments.filter((sp) =>
-    dateIsInMonth(sp.payment_date, selectedMonth),
-  )
-  const staffPaid = monthStaffPayments
-    .filter((sp) => sp.status === "Paid")
-    .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
-  const staffPending = monthStaffPayments
-    .filter((sp) => sp.status === "Pending")
-    .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+  const totalExpenses =
+    monthExpenses.reduce((sum, e) => sum + Number(e.amount || 0), 0) +
+    legacyStaffTotal
 
-  const estimatedProfit = cashReceived - totalOperatingExpenses
+  // Net Income = Total Income − Total Expenses
+  const netIncome = cashReceived - totalExpenses
+
+  const staffSalaryExpenses = monthExpenses.filter((e) => isStaffSalaryExpense(e))
+  const staffPaid =
+    staffSalaryExpenses
+      .filter((e) => e.status === "Paid")
+      .reduce((sum, e) => sum + Number(e.amount || 0), 0) +
+    legacyMonthStaffPayments
+      .filter((sp) => sp.status === "Paid")
+      .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+
+  const staffPending =
+    staffSalaryExpenses
+      .filter((e) => e.status === "Pending")
+      .reduce((sum, e) => sum + Number(e.amount || 0), 0) +
+    legacyMonthStaffPayments
+      .filter((sp) => sp.status === "Pending")
+      .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
 
   const expenseCategories = useMemo(() => {
     const cats: Record<string, number> = {}
     monthExpenses.forEach((e) => {
       cats[e.category] = (cats[e.category] || 0) + Number(e.amount || 0)
     })
+    if (legacyStaffTotal > 0) {
+      cats["Staff Salary (Legacy)"] = (cats["Staff Salary (Legacy)"] || 0) + legacyStaffTotal
+    }
     return cats
-  }, [monthExpenses])
+  }, [monthExpenses, legacyStaffTotal])
+
+  const handleDownloadPdf = async () => {
+    setIsGeneratingPdf(true)
+    try {
+      await downloadPdfReport({
+        monthInfo,
+        clients,
+        payments,
+        expenses,
+        staff,
+        staffPayments,
+        settings,
+        currency,
+        reportType,
+      })
+    } catch (err) {
+      console.error("[Filmdappa CRM] PDF generation error:", err)
+      alert("Failed to generate PDF. Please try again.")
+    } finally {
+      setIsGeneratingPdf(false)
+    }
+  }
+
+  const handlePrintPreview = () => {
+    openPrintableReport({
+      monthInfo,
+      clients,
+      payments,
+      expenses,
+      staff,
+      staffPayments,
+      settings,
+      currency,
+      reportType,
+    })
+  }
 
   return (
     <>
       <PageHeader
         eyebrow="Financial reporting"
         title="Month-end report"
-        description={`${monthInfo.label} · Revenue, cash and profit derived from actual Supabase records.`}
+        description={`${monthInfo.label} · Revenue, cash and net income derived from actual Supabase records.`}
         action={
-          <div className="button-row">
+          <div className="button-row" style={{ flexWrap: "wrap" }}>
             <MonthNavigator
               selectedMonth={selectedMonth}
               onChange={onMonthChange}
             />
+            <Button
+              variant="outline"
+              icon="calendar"
+              onClick={handlePrintPreview}
+              title="Open print preview / browser Save as PDF"
+            >
+              Print / Preview
+            </Button>
+            <Button
+              icon="download"
+              onClick={handleDownloadPdf}
+              disabled={isGeneratingPdf}
+              title="Generate and download official PDF report with logo & watermark"
+            >
+              {isGeneratingPdf ? "Generating PDF..." : "Download PDF Report"}
+            </Button>
           </div>
         }
       />
@@ -1861,6 +2717,29 @@ function Reports({
         <div>
           <span>Reporting period</span>
           <strong>{monthInfo.label}</strong>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          <span style={{ fontSize: "10px", fontWeight: 700, textTransform: "uppercase", color: "var(--muted)" }}>
+            Report Scope:
+          </span>
+          <select
+            value={reportType}
+            onChange={(e) => setReportType(e.target.value as ReportType)}
+            style={{
+              padding: "6px 12px",
+              borderRadius: "6px",
+              border: "1px solid var(--black)",
+              background: "#ffffff",
+              fontSize: "11px",
+              fontWeight: 700,
+              cursor: "pointer",
+            }}
+          >
+            <option value="comprehensive">Comprehensive Statement</option>
+            <option value="clients">Client Collections & Revenue</option>
+            <option value="staff">Staff Salary & Compensation</option>
+            <option value="expenses">Operating Expenses Ledger</option>
+          </select>
         </div>
         <span>
           Prepared from ledger records as of {formatDateDisplay(monthInfo.endDate)}
@@ -1872,12 +2751,12 @@ function Reports({
           ["Total revenue", formatMoney(totalRevenue, currency)],
           ["Cash received", formatMoney(cashReceived, currency)],
           ["Outstanding payments", formatMoney(outstanding, currency)],
-          ["Operating expenses", formatMoney(totalOperatingExpenses, currency)],
+          ["Total expenses", formatMoney(totalExpenses, currency)],
           [
             "Staff paid / pending",
             `${formatMoney(staffPaid, currency)} / ${formatMoney(staffPending, currency)}`,
           ],
-          ["Estimated profit", formatMoney(estimatedProfit, currency)],
+          ["Net income", formatMoney(netIncome, currency)],
         ].map(([a, b], i) => (
           <article
             className={i === 5 ? "summary-card highlight" : "summary-card"}
@@ -1943,14 +2822,26 @@ function Reports({
           ) : (
             <div className="report-list">
               {staff.map((s) => {
-                const sPaid = monthStaffPayments
-                  .filter((sp) => sp.staff_id === s.id && sp.status === "Paid")
-                  .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
-                const sPending = monthStaffPayments
-                  .filter(
-                    (sp) => sp.staff_id === s.id && sp.status === "Pending",
-                  )
-                  .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+                const sSalaryExpenses = monthExpenses.filter(
+                  (e) => isStaffSalaryExpense(e) && expenseMatchesStaff(e, s),
+                )
+                const sLegacyPayments = legacyMonthStaffPayments.filter(
+                  (sp) => sp.staff_id === s.id,
+                )
+                const sPaid =
+                  sSalaryExpenses
+                    .filter((e) => e.status === "Paid")
+                    .reduce((sum, e) => sum + Number(e.amount || 0), 0) +
+                  sLegacyPayments
+                    .filter((sp) => sp.status === "Paid")
+                    .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
+                const sPending =
+                  sSalaryExpenses
+                    .filter((e) => e.status === "Pending")
+                    .reduce((sum, e) => sum + Number(e.amount || 0), 0) +
+                  sLegacyPayments
+                    .filter((sp) => sp.status === "Pending")
+                    .reduce((sum, sp) => sum + Number(sp.amount || 0), 0)
 
                 return (
                   <div key={s.id}>
@@ -2002,7 +2893,7 @@ function Reports({
             )}
             <span className="total">
               Total expenses
-              <b>{formatMoney(totalOperatingExpenses, currency)}</b>
+              <b>{formatMoney(totalExpenses, currency)}</b>
             </span>
           </div>
         </div>
@@ -2206,7 +3097,7 @@ function Modal({
   clients: ClientRecord[]
   staff: StaffRecord[]
   close: () => void
-  onRecordSaved: (msg: string) => void
+  onRecordSaved: (msg: string, record?: any) => void
 }) {
   const currentMonthInfo = getMonthByKey(selectedMonth)
   const defaultDate = `${selectedMonth}-01`
@@ -2215,9 +3106,15 @@ function Modal({
   const [cName, setCName] = useState(initialData?.name || "")
   const [cBusiness, setCBusiness] = useState(initialData?.business || "")
   const [cPhone, setCPhone] = useState(initialData?.phone || "+91 ")
-  const [cAmount, setCAmount] = useState(String(initialData?.amount ?? "0"))
-  const [cVideos, setCVideos] = useState(String(initialData?.videos ?? "0"))
-  const [cPosters, setCPosters] = useState(String(initialData?.posters ?? "0"))
+  const [cAmount, setCAmount] = useState(
+    initialData?.amount !== undefined ? String(initialData.amount) : "",
+  )
+  const [cVideos, setCVideos] = useState(
+    initialData?.videos !== undefined ? String(initialData.videos) : "",
+  )
+  const [cPosters, setCPosters] = useState(
+    initialData?.posters !== undefined ? String(initialData.posters) : "",
+  )
   const [cStart, setCStart] = useState(initialData?.start_date || defaultDate)
   const [cEnd, setCEnd] = useState(initialData?.end_date || currentMonthInfo.endDate)
   const [cStatus, setCStatus] = useState<"Active" | "Ending soon" | "Inactive">(
@@ -2225,13 +3122,26 @@ function Modal({
   )
   const [cNotes, setCNotes] = useState(initialData?.notes || "")
 
+  // Check if targetId is a staff member or client
+  const targetStaff = staff.find((s) => s.id === targetId)
+  const targetClient = clients.find((c) => c.id === targetId)
+
   // Expense form state
   const [eDate, setEDate] = useState(initialData?.date || defaultDate)
   const [eCategory, setECategory] = useState(initialData?.category || "Staff Salary")
   const [eDesc, setEDesc] = useState(initialData?.description || "")
-  const [eAmount, setEAmount] = useState(String(initialData?.amount ?? "0"))
-  const [eRecipient, setERecipient] = useState(initialData?.recipient || "")
-  const [eClientId, setEClientId] = useState(initialData?.client_id || targetId || "")
+  const [eAmount, setEAmount] = useState(
+    initialData?.amount !== undefined ? String(initialData.amount) : "",
+  )
+  const [eRecipient, setERecipient] = useState(
+    initialData?.recipient || targetStaff?.name || "",
+  )
+  const [eStaffId, setEStaffId] = useState(
+    initialData?.staff_id || targetStaff?.id || "",
+  )
+  const [eClientId, setEClientId] = useState(
+    initialData?.client_id || targetClient?.id || "",
+  )
   const [eStatus, setEStatus] = useState<"Paid" | "Pending">(
     initialData?.status || "Paid",
   )
@@ -2245,14 +3155,16 @@ function Modal({
   const [sRole, setSRole] = useState<
     "Editor" | "Cameraman" | "Poster Designer" | "Other"
   >(initialData?.role || "Editor")
-  const [sSalary, setSSalary] = useState(String(initialData?.salary ?? "0"))
+  const [sSalary, setSSalary] = useState(
+    initialData?.salary !== undefined ? String(initialData.salary) : "",
+  )
   const [sStatus, setSStatus] = useState<"Active" | "Inactive">(
     initialData?.status || "Active",
   )
 
   // Payment form state
   const [pClientId, setPClientId] = useState(targetId || clients[0]?.id || "")
-  const [pAmount, setPAmount] = useState("0")
+  const [pAmount, setPAmount] = useState("")
   const [pDate, setPDate] = useState(defaultDate)
   const [pMethod, setPMethod] = useState<"Bank transfer" | "UPI" | "Cash" | "Card">(
     "Bank transfer",
@@ -2262,7 +3174,9 @@ function Modal({
 
   // Deliverable form state
   const [dTitle, setDTitle] = useState("")
-  const [dStaff, setDStaff] = useState(staff[0]?.name || "")
+  const [dStaff, setDStaff] = useState(
+    staff[0]?.name ? `${staff[0].name} (${staff[0].role})` : "Unassigned",
+  )
   const [dStatus, setDStatus] = useState<"Pending" | "In Progress" | "Completed">(
     "Pending",
   )
@@ -2271,7 +3185,7 @@ function Modal({
   // Staff Payment form state
   const [spStaffId, setSpStaffId] = useState(targetId || staff[0]?.id || "")
   const [spDate, setSpDate] = useState(defaultDate)
-  const [spAmount, setSpAmount] = useState("0")
+  const [spAmount, setSpAmount] = useState("")
   const [spType, setSpType] = useState<
     "Salary" | "Project Payment" | "Advance" | "Other"
   >("Salary")
@@ -2288,6 +3202,7 @@ function Modal({
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (submitting) return
     setErr("")
     setSubmitting(true)
 
@@ -2301,15 +3216,30 @@ function Modal({
             `Dates must be between ${MIN_FINANCIAL_DATE} and ${MAX_FINANCIAL_DATE}.`,
           )
         }
+        if (cStart > cEnd) {
+          throw new Error("Agreement start date cannot be after end date.")
+        }
+        const amt = parseFloat(cAmount) || 0
+        if (amt < 0) {
+          throw new Error("Monthly package amount cannot be negative.")
+        }
+        const vids = parseInt(cVideos, 10) || 0
+        if (vids < 0) {
+          throw new Error("Videos per month cannot be negative.")
+        }
+        const posts = parseInt(cPosters, 10) || 0
+        if (posts < 0) {
+          throw new Error("Posters per month cannot be negative.")
+        }
 
         if (isEditing) {
-          await updateClient(initialData.id, {
+          const updated = await updateClient(initialData.id, {
             name: cName.trim(),
             business: cBusiness.trim(),
             phone: cPhone.trim(),
-            amount: parseFloat(cAmount) || 0,
-            videos: parseInt(cVideos, 10) || 0,
-            posters: parseInt(cPosters, 10) || 0,
+            amount: amt,
+            videos: vids,
+            posters: posts,
             start_date: cStart,
             end_date: cEnd,
             status: cStatus,
@@ -2319,16 +3249,17 @@ function Modal({
             "User",
             "Client Updated",
             `Updated client: ${cBusiness}`,
+            formatMoney(amt),
           )
-          onRecordSaved(`Client ${cBusiness} updated successfully in Supabase.`)
+          onRecordSaved(`Client ${cBusiness} updated successfully in Supabase.`, updated)
         } else {
-          await createClient({
+          const saved = await createClient({
             name: cName.trim(),
             business: cBusiness.trim(),
             phone: cPhone.trim(),
-            amount: parseFloat(cAmount) || 0,
-            videos: parseInt(cVideos, 10) || 0,
-            posters: parseInt(cPosters, 10) || 0,
+            amount: amt,
+            videos: vids,
+            posters: posts,
             start_date: cStart,
             end_date: cEnd,
             status: cStatus,
@@ -2338,8 +3269,9 @@ function Modal({
             "User",
             "Client Added",
             `Registered client: ${cBusiness}`,
+            formatMoney(amt),
           )
-          onRecordSaved(`Client ${cBusiness} saved to Supabase successfully.`)
+          onRecordSaved(`Client ${cBusiness} saved to Supabase successfully.`, saved)
         }
         close()
       } else if (type === "expense") {
@@ -2360,6 +3292,7 @@ function Modal({
             category: eCategory,
             description: eDesc.trim() || `${eCategory} expense`,
             recipient: eRecipient.trim() || "Vendor",
+            staff_id: eStaffId || null,
             client_id: eClientId || null,
             client_name: related ? related.business : "—",
             amount: amt,
@@ -2381,6 +3314,7 @@ function Modal({
             category: eCategory,
             description: eDesc.trim() || `${eCategory} expense`,
             recipient: eRecipient.trim() || "Vendor",
+            staff_id: eStaffId || null,
             client_id: eClientId || null,
             client_name: related ? related.business : "—",
             amount: amt,
@@ -2631,7 +3565,7 @@ function Modal({
                 label="Agreement end date"
                 type="date"
                 value={cEnd}
-                onChange={setCEEnd}
+                onChange={setCEnd}
                 min={MIN_FINANCIAL_DATE}
                 max={MAX_FINANCIAL_DATE}
                 required
@@ -2649,6 +3583,8 @@ function Modal({
                 placeholder="Important project notes, deliverable scope or terms"
                 value={cNotes}
                 onChange={setCNotes}
+                isTextArea
+                rows={3}
               />
             </>
           )}
@@ -2680,6 +3616,32 @@ function Modal({
                 ]}
                 onChange={setECategory}
               />
+              {eCategory === "Staff Salary" && staff.length > 0 && (
+                <SelectField
+                  label="Team member"
+                  value={eStaffId}
+                  options={[
+                    { label: "Select team member...", value: "" },
+                    ...staff.map((s) => ({
+                      label: `${s.name} (${s.role})${s.salary > 0 ? ` — ₹${s.salary}` : ""}`,
+                      value: s.id,
+                    })),
+                  ]}
+                  onChange={(val) => {
+                    setEStaffId(val)
+                    const sel = staff.find((s) => s.id === val)
+                    if (sel) {
+                      setERecipient(sel.name)
+                      if (!eAmount && sel.salary > 0) {
+                        setEAmount(String(sel.salary))
+                      }
+                      if (!eDesc || eDesc === "Monthly staff salary") {
+                        setEDesc(`${sel.name} — Monthly salary`)
+                      }
+                    }
+                  }}
+                />
+              )}
               <Field
                 label="Description"
                 placeholder="Details of expense"
@@ -2969,7 +3931,7 @@ function Modal({
 // ─── Main App Entry Component ───────────────────────────────────────────────
 
 export default function App() {
-  const { step, isLoading, logout, user, email } = useAuth()
+  const { step, isLoading, logout, user, email, role, isOwner, authorizedUser } = useAuth()
   const [page, setPage] = useState<Page>("Dashboard")
   const [mobileNav, setMobileNav] = useState(false)
   const [clientId, setClientId] = useState<string | null>(null)
@@ -3030,16 +3992,21 @@ export default function App() {
     }
   }
 
+  // Only trigger full data fetch once the user is authenticated with a valid Supabase JWT
   useEffect(() => {
-    reloadData()
-  }, [])
+    if (step === "authenticated") {
+      reloadData()
+    }
+  }, [step])
 
-  // Derive display name: "Lakshan Sudhakar" by default, or user's custom metadata
+  // Derive display name: user's full_name from authorized_users, user_metadata, or "Lakshan Sudhakar"
   const userMetaName = user?.user_metadata?.full_name as string | undefined
   const displayName =
-    userMetaName && userMetaName.trim().length > 0 && userMetaName !== "Faizal Dappa"
-      ? userMetaName
-      : "Lakshan Sudhakar"
+    authorizedUser?.full_name && authorizedUser.full_name.trim().length > 0
+      ? authorizedUser.full_name
+      : userMetaName && userMetaName.trim().length > 0 && userMetaName !== "Faizal Dappa"
+        ? userMetaName
+        : "Lakshan Sudhakar"
 
   const initials =
     displayName
@@ -3052,9 +4019,34 @@ export default function App() {
   const currency = settings.currency || "INR — Indian Rupee"
 
   const title = useMemo(
-    () => (clientId ? "Client details" : staffId ? "Staff profile" : page),
+    () =>
+      clientId
+        ? "Client details"
+        : staffId
+          ? "Staff profile"
+          : page === "Add Client"
+            ? "Add new client"
+            : page,
     [clientId, staffId, page],
   )
+
+  // Listen for browser URL / popstate / hashchange events
+  useEffect(() => {
+    const handleUrlChange = () => {
+      const route = parseRouteFromUrl()
+      setPage(route.page)
+      setClientId(route.clientId)
+      setStaffId(route.staffId)
+    }
+
+    handleUrlChange()
+    window.addEventListener("popstate", handleUrlChange)
+    window.addEventListener("hashchange", handleUrlChange)
+    return () => {
+      window.removeEventListener("popstate", handleUrlChange)
+      window.removeEventListener("hashchange", handleUrlChange)
+    }
+  }, [])
 
   // ─── Delete Handlers with User Confirmation ───────────────────────────────
 
@@ -3071,6 +4063,7 @@ export default function App() {
       await logCrmAction("User", "Client Deleted", `Deleted client: ${name}`)
       showToast(`Client "${name}" deleted from Supabase.`)
       setClientId(null)
+      updateBrowserUrl("Clients")
       await reloadData()
     } catch (err) {
       alert(err instanceof Error ? err.message : "Failed to delete client.")
@@ -3108,6 +4101,7 @@ export default function App() {
       await logCrmAction("User", "Staff Deleted", `Removed staff: ${name}`)
       showToast(`Staff profile for "${name}" deleted from Supabase.`)
       setStaffId(null)
+      updateBrowserUrl("Staff")
       await reloadData()
     } catch (err) {
       alert(err instanceof Error ? err.message : "Failed to delete staff.")
@@ -3218,10 +4212,61 @@ export default function App() {
     setClientId(null)
     setStaffId(null)
     setMobileNav(false)
+    updateBrowserUrl(next)
+  }
+
+  const openAddClient = () => {
+    setPage("Add Client")
+    setClientId(null)
+    setStaffId(null)
+    setMobileNav(false)
+    updateBrowserUrl("Add Client")
+  }
+
+  const handleOpenClient = (id: string) => {
+    setClientId(id)
+    setStaffId(null)
+    setMobileNav(false)
+    updateBrowserUrl("Clients", id)
+  }
+
+  const handleOpenStaff = (id: string) => {
+    setStaffId(id)
+    setClientId(null)
+    setMobileNav(false)
+    updateBrowserUrl("Staff", null, id)
+  }
+
+  const handleBackToClients = () => {
+    setClientId(null)
+    updateBrowserUrl("Clients")
+  }
+
+  const handleBackToStaff = () => {
+    setStaffId(null)
+    updateBrowserUrl("Staff")
   }
 
   let content: ReactNode
-  if (clientId) {
+  if (page === "Add Client") {
+    content = (
+      <AddClientPage
+        onCancel={() => {
+          setPage("Clients")
+          updateBrowserUrl("Clients")
+        }}
+        onClientCreated={async (newClient) => {
+          showToast(`Client "${newClient.business}" saved to Supabase successfully.`)
+          await reloadData()
+          setClientId(newClient.id)
+          setPage("Clients")
+          updateBrowserUrl("Clients", newClient.id)
+        }}
+        currency={currency}
+        selectedMonth={selectedMonth}
+      />
+    )
+  } else if (clientId) {
     content = (
       <ClientDetails
         id={clientId}
@@ -3229,7 +4274,7 @@ export default function App() {
         payments={payments}
         expenses={expenses}
         deliverables={deliverables}
-        back={() => setClientId(null)}
+        back={handleBackToClients}
         openModal={(type, cId, initData) =>
           setModal({ type, targetId: cId || clientId, initialData: initData })
         }
@@ -3247,13 +4292,15 @@ export default function App() {
         id={staffId}
         staff={staff}
         staffPayments={staffPayments}
+        expenses={expenses}
         selectedMonth={selectedMonth}
-        back={() => setStaffId(null)}
+        back={handleBackToStaff}
         openModal={(type, sId, initData) =>
           setModal({ type, targetId: sId || staffId, initialData: initData })
         }
         onDeleteStaff={handleDeleteStaff}
         onDeleteStaffPayment={handleDeleteStaffPayment}
+        onDeleteExpense={handleDeleteExpense}
         currency={currency}
       />
     )
@@ -3275,8 +4322,15 @@ export default function App() {
     content = (
       <Clients
         clients={clients}
-        openClient={setClientId}
-        openModal={(type) => setModal({ type })}
+        openClient={handleOpenClient}
+        openAddClient={openAddClient}
+        openModal={(type) => {
+          if (type === "client") {
+            openAddClient()
+          } else {
+            setModal({ type })
+          }
+        }}
         currency={currency}
       />
     )
@@ -3298,9 +4352,15 @@ export default function App() {
       <Staff
         staff={staff}
         staffPayments={staffPayments}
+        expenses={expenses}
         selectedMonth={selectedMonth}
-        openStaff={setStaffId}
-        openModal={(type) => setModal({ type })}
+        onMonthChange={setSelectedMonth}
+        openStaff={handleOpenStaff}
+        openModal={(type, sId, initData) =>
+          setModal({ type, targetId: sId, initialData: initData })
+        }
+        onDeleteExpense={handleDeleteExpense}
+        onDeleteStaffPayment={handleDeleteStaffPayment}
         currency={currency}
       />
     )
@@ -3315,6 +4375,7 @@ export default function App() {
         staff={staff}
         staffPayments={staffPayments}
         currency={currency}
+        settings={settings}
       />
     )
   } else if (page === "Audit Logs") {
@@ -3354,7 +4415,12 @@ export default function App() {
             <button
               key={item.label}
               className={
-                page === item.label && !clientId && !staffId ? "active" : ""
+                (page === item.label ||
+                  (item.label === "Clients" && page === "Add Client")) &&
+                !clientId &&
+                !staffId
+                  ? "active"
+                  : ""
               }
               onClick={() => go(item.label)}
             >
@@ -3420,9 +4486,14 @@ export default function App() {
           clients={clients}
           staff={staff}
           close={() => setModal(null)}
-          onRecordSaved={(msg) => {
+          onRecordSaved={(msg, newRecord) => {
             showToast(msg)
             reloadData()
+            if (modal.type === "client" && newRecord?.id) {
+              setClientId(newRecord.id)
+              setPage("Clients")
+              updateBrowserUrl("Clients", newRecord.id)
+            }
           }}
         />
       )}

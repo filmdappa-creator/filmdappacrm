@@ -51,14 +51,69 @@ comment on table public.face_verification_sessions is
 
 -- ── 4. Row Level Security ────────────────────────────────────────────────────
 
--- authorized_users: only the service role (Edge Functions / admin) can read/write
+-- Helper function: check if authenticated caller is active owner
+create or replace function public.is_crm_owner()
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select exists (
+    select 1
+    from public.authorized_users
+    where lower(email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+      and role = 'owner'
+      and is_active = true
+  );
+$$;
+
+grant execute on function public.is_crm_owner() to authenticated;
+
+-- Schema grants for Supabase roles
+grant usage on schema public to anon, authenticated;
+grant select, insert, update, delete on public.authorized_users to authenticated;
+
+-- authorized_users: Authenticated users can read only their own record; owners can manage team
 alter table public.authorized_users enable row level security;
 
-create policy "No direct client access to authorized_users"
+drop policy if exists "No direct client access to authorized_users" on public.authorized_users;
+drop policy if exists "Authenticated users can read authorized_users" on public.authorized_users;
+drop policy if exists "Users can read own authorized_user profile" on public.authorized_users;
+drop policy if exists "Users can update own authorized_user profile" on public.authorized_users;
+drop policy if exists "Owners can update authorized_users" on public.authorized_users;
+drop policy if exists "Owners can insert authorized_users" on public.authorized_users;
+drop policy if exists "Owners can delete authorized_users" on public.authorized_users;
+
+-- SELECT: users read only their own record; owners can view all
+create policy "Users can read own authorized_user profile"
   on public.authorized_users
-  for all
+  for select
   to authenticated
-  using (false);  -- Block all authenticated client reads; use Edge Function for lookup
+  using (
+    lower(email) = lower(coalesce(auth.jwt() ->> 'email', ''))
+    or public.is_crm_owner()
+  );
+
+-- Only active owners can insert, update, or delete authorized users
+create policy "Owners can insert authorized_users"
+  on public.authorized_users
+  for insert
+  to authenticated
+  with check (public.is_crm_owner());
+
+create policy "Owners can update authorized_users"
+  on public.authorized_users
+  for update
+  to authenticated
+  using (public.is_crm_owner())
+  with check (public.is_crm_owner());
+
+create policy "Owners can delete authorized_users"
+  on public.authorized_users
+  for delete
+  to authenticated
+  using (public.is_crm_owner());
 
 -- auth_audit_log: append-only from clients; admins can read via service role
 alter table public.auth_audit_log enable row level security;
