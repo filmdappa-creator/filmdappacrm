@@ -152,6 +152,11 @@ function formatDbError(error: any): string {
     hint: error.hint,
   })
 
+  // 0. Invalid path in Supabase URL
+  if (error.code === 'PGRST126' || error.message?.toLowerCase().includes('invalid path')) {
+    return 'Invalid Supabase project URL path. Please ensure VITE_SUPABASE_URL points strictly to your project URL (https://<project-ref>.supabase.co) without /rest/v1 or /auth/v1.'
+  }
+
   // 1. Missing database table
   if (
     error.code === '42P01' ||

@@ -1,5 +1,12 @@
 {
-  "description": "Streamline client and financial management for authorized staff at Filmdappa Media Company with a clean, efficient dashboard for tracking revenue, expenses, and work progress.",
+  "title": "Filmdappa CRM",
+  "description": "Filmdappa Media Company – Internal Business Management CRM.",
+  "icons": {
+    "icon": "/favicon-32x32.png"
+  },
+  "openGraph": {
+    "image": "/favicon-192x192.png"
+  },
   "robots": {
     "index": false
   },

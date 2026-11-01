@@ -1,6 +1,6 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from 'react'
 import { Session, User } from '@supabase/supabase-js'
-import { supabase, isSupabaseReady } from '../lib/supabase'
+import { supabase, isSupabaseReady, getAppRedirectUrl, formatAuthError } from '../lib/supabase'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -213,7 +213,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     restoreSession()
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
       if (!session) {
         setState(s => ({
           ...s,
@@ -227,6 +227,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           otpSentAt: null,
           otpAttempts: 0,
         }))
+      } else if (event === 'SIGNED_IN' || event === 'USER_UPDATED') {
+        // Automatically handle magic link callbacks or session promotions
+        await restoreSession()
       }
     })
 
@@ -282,32 +285,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       }
 
-      // Supabase OTP: sends an 8-digit OTP to the email.
+      // Supabase OTP: sends a verification code to the email.
       // Only authorized users (those who have accounts in Supabase Auth) should receive the OTP.
+      const redirectUrl = getAppRedirectUrl()
+      console.info('[Filmdappa Auth] Requesting OTP verification for:', trimmed)
       const { error } = await supabase.auth.signInWithOtp({
         email: trimmed,
         options: {
           shouldCreateUser: false, // Only allow pre-registered users
+          // Only pass emailRedirectTo when an explicit VITE_APP_URL is configured to prevent allowlist path rejections
+          ...(import.meta.env.VITE_APP_URL && redirectUrl ? { emailRedirectTo: redirectUrl } : {}),
         },
       })
 
       if (error) {
-        console.warn('[Filmdappa Auth] signInWithOtp response error:', error.message)
-        // Supabase returns various messages for unregistered/disabled users
-        const msg = error.message.toLowerCase()
-        if (
-          msg.includes('signups not allowed') ||
-          msg.includes('user not found') ||
-          msg.includes('email not confirmed') ||
-          msg.includes('invalid login credentials')
-        ) {
-          throw new Error(`The email "${trimmed}" is not registered in Filmdappa CRM. Contact your administrator to invite your account.`)
-        }
-        // Supabase rate-limit message
-        if (msg.includes('for security purposes')) {
-          throw new Error('Too many requests. Please wait a moment before trying again.')
-        }
-        throw error
+        console.warn('[Filmdappa Auth] signInWithOtp response error:', error)
+        throw new Error(formatAuthError(error, trimmed))
       }
 
       await logAuditEvent('otp_requested', trimmed)
@@ -321,7 +314,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         error: null,
       }))
     } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : 'Failed to send verification code.'
+      const message = formatAuthError(err, trimmed)
       await logAuditEvent('otp_request_failed', trimmed, null, { reason: message })
       setState(s => ({ ...s, isLoading: false, error: message }))
     }
@@ -352,13 +345,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const attempts = state.otpAttempts + 1
         const remaining = MAX_OTP_ATTEMPTS - attempts
 
-        let message = 'Incorrect or expired verification code.'
+        let message = formatAuthError(error, normalizedEmail)
         if (attempts >= MAX_OTP_ATTEMPTS) {
           message = 'Too many failed attempts. Please request a new code.'
-        } else if (remaining === 1) {
-          message = `Incorrect code. 1 attempt remaining.`
-        } else {
-          message = `Incorrect code. ${remaining} attempts remaining.`
+        } else if (
+          error.message?.toLowerCase().includes('token') ||
+          error.message?.toLowerCase().includes('otp') ||
+          error.message?.toLowerCase().includes('invalid')
+        ) {
+          message = remaining === 1
+            ? 'Incorrect code. 1 attempt remaining.'
+            : `Incorrect code. ${remaining} attempts remaining.`
         }
 
         await logAuditEvent('otp_verification_failed', normalizedEmail, null, { attempts })

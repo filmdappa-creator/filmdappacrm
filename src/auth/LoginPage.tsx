@@ -135,7 +135,8 @@ function EmailStep() {
 
 // ─── Step 2 – OTP entry ───────────────────────────────────────────────────────
 
-const OTP_LENGTH = 8
+const MIN_OTP_LENGTH = 6
+const MAX_OTP_LENGTH = 8
 const OTP_COOLDOWN_SECONDS = 60
 
 function OtpStep() {
@@ -156,9 +157,11 @@ function OtpStep() {
     return () => clearInterval(id)
   }, [otpSentAt])
 
+  const isValidOtp = otp.trim().length >= MIN_OTP_LENGTH && otp.trim().length <= MAX_OTP_LENGTH
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
-    if (otp.trim().length === OTP_LENGTH) {
+    if (isValidOtp) {
       await verifyOtp(otp.trim())
     }
   }
@@ -170,8 +173,8 @@ function OtpStep() {
   }
 
   const handleOtpChange = (value: string) => {
-    // Only allow digits up to OTP_LENGTH
-    const digits = value.replace(/\D/g, '').slice(0, OTP_LENGTH)
+    // Only allow digits up to MAX_OTP_LENGTH (supports standard 6-digit & 8-digit OTPs)
+    const digits = value.replace(/\D/g, '').slice(0, MAX_OTP_LENGTH)
     setOtp(digits)
     clearError()
   }
@@ -182,7 +185,7 @@ function OtpStep() {
         <span className="eyebrow">Email verification</span>
         <h2>Enter your code</h2>
         <p>
-          We sent an 8-digit code to{' '}
+          We sent a verification code to{' '}
           <strong style={{ color: 'var(--black)' }}>{email}</strong>.
           <br />
           It expires in 5 minutes.
@@ -196,12 +199,12 @@ function OtpStep() {
           type="text"
           inputMode="numeric"
           pattern="[0-9]*"
-          placeholder="00000000"
+          placeholder="Enter verification code"
           value={otp}
           onChange={e => handleOtpChange(e.target.value)}
           autoComplete="one-time-code"
           autoFocus
-          maxLength={OTP_LENGTH}
+          maxLength={MAX_OTP_LENGTH}
           disabled={isLoading}
         />
       </label>
@@ -216,7 +219,7 @@ function OtpStep() {
         id="btn-verify-otp"
         type="submit"
         className="btn btn-dark"
-        disabled={isLoading || otp.trim().length !== OTP_LENGTH}
+        disabled={isLoading || !isValidOtp}
       >
         {isLoading ? <LoadingDots /> : 'Verify code'}
       </button>
